@@ -1,0 +1,927 @@
+#!/usr/bin/env perl
+
+package NixPostBuildPush;
+
+use strict;
+use warnings;
+
+use version 0.77;
+our $VERSION = version->declare('v0.1.0');
+
+use Getopt::Long ();
+use JSON::PP;
+use List::Util qw(uniqstr);
+use Pod::Usage ();
+
+use Nix::Config ();
+use Nix::Store ();
+
+package _utils::env {
+    sub fetchenvCond($&&) {
+        exists $ENV{$_[0]} && $_[1]->($ENV{$_[0]}) ? $ENV{$_[0]} : $_[2]->();
+    }
+
+    sub fetchenv($&) {
+        my ( $key, $def ) = @_;
+        fetchenvCond($key, sub { 1 }, \&$def);
+    }
+
+    sub fetchenvNonempty($&) {
+        my ( $key, $def ) = @_;
+        fetchenvCond($key, sub { $_[0] ne '' }, \&$def);
+    }
+
+    sub fetchenvNamespaced($&) {
+        my ( $key, $def ) = @_;
+        fetchenvNonempty((sprintf 'NIX_POST_BUILD_PUSH_%s', uc ($key =~ s/-/_/gr)), \&$def);
+    }
+}
+
+package _utils::log {
+    sub diag {
+        warn "$0: $_\n" for @_;
+    }
+
+    sub _utils::log::bail {
+        diag @_;
+        exit 1;
+    }
+}
+
+package _utils::path {
+    use File::Basename ();
+
+    # Make this available as `_utils::path::canonpath`
+    use File::Spec::Functions qw(canonpath);
+
+    sub dirname($) {
+        canonpath((File::Basename::fileparse($_[0]))[1])
+    }
+
+    sub basename($) {
+        (File::Basename::fileparse($_[0]))[0]
+    }
+
+    sub catdir {
+        canonpath(File::Spec->catdir(@_));
+    }
+
+    sub catfile {
+        canonpath(File::Spec->catfile(@_));
+    }
+}
+
+package _utils::proc {
+    sub waiter($$&) {
+        my ( $wait, $desc, $code ) = @_;
+
+        $desc //= 'child';
+
+        if ( $wait == -1 ) {
+            _utils::log::bail "$desc failed to execute: $!";
+        }
+        elsif ( my $sig = $wait & 127 ) {
+            _utils::log::bail sprintf('%s died with signal %d, %s coredump', $desc, $sig, (($wait & 128) ? 'with' : 'without'));
+        }
+        else {
+            $code->( $wait, $desc );
+        }
+    }
+
+    sub handlewait($;$) {
+        waiter($_[0], $_[1], sub {
+            my ( $wait, $desc ) = @_;
+            _utils::log::bail sprintf('%s exited with %d', $desc, $wait >> 8) if $wait != 0;
+        });
+    }
+
+    sub handlexargs($;$) {
+        waiter($_[0], $_[1], sub {
+            my ( $wait, $desc ) = @_;
+
+            my $status = $wait >> 8;
+
+            if ( $status == 123 ) {
+                _utils::log::bail("$desc exited with status 1-125");
+            }
+            elsif ( $status == 124 ) {
+                _utils::log::bail("$desc exited with status 255");
+            }
+            elsif ( $status == 126 ) {
+                _utils::log::bail("$desc cannot be run");
+            }
+            elsif ( $status == 127 ) {
+                _utils::log::bail("$desc is not found");
+            }
+            elsif ( $status != 0 ) {
+                _utils::log::bail("unknown error running $desc");
+            }
+        });
+    }
+
+    sub waitchild($) {
+        handlewait(waitpid($_[0], 0), $_[1]);
+    }
+}
+
+package _utils::cmd {
+    use IPC::Cmd ();
+    use List::Util qw(pairmap);
+    use Scalar::Util qw(blessed);
+
+    sub flags {
+        local ( $a, $b );
+
+        pairmap {
+            my $len = length $a;
+            _utils::log::bail 'empty or unset option' if $len == 0;
+            my $flag = $len > 1 ? (sprintf '--%s', ($a =~ s/_/-/gr)) : "-${a}";
+
+            if ( blessed $b and $b->isa('JSON::PP::Boolean') ) {
+                if ( $b ) {
+                    return $flag;
+                }
+                elsif ( $len > 1 ) {
+                    return "--no-${a}";
+                }
+                else {
+                    return ();
+                }
+            }
+            else {
+                return ( $flag, $b );
+            }
+        } @_;
+    }
+
+    sub constructCmd {
+        my $opts = ref $_[-1] eq 'HASH' ? pop : {};
+        [ @_, flags( %$opts ) ];
+    }
+
+    sub runCmdWith {
+        my ( $code, %opts ) = @_;
+
+        my $cmd = delete $opts{command};
+        _utils::log::bail 'no command provided' if @$cmd < 1;
+
+        my $options = (delete $opts{options}) // {};
+        my $full_cmd = constructCmd( @$cmd, $options );
+
+        $code->( \%opts, $full_cmd );
+    }
+
+    sub runCmd {
+        runCmdWith(sub {
+            my ( $opts, $cmd ) = @_;
+            IPC::Cmd::run( %$opts, command => $cmd );
+        }, @_);
+    }
+}
+
+package _utils::nix {
+    sub outPaths {
+        split /\s+/, _utils::env::fetchenv('OUT_PATHS', sub { '' });
+    }
+}
+
+use constant {
+    DEFAULT_CLOSURE_TYPE    => 'binary',
+    TRUE                    => JSON::PP::true,
+    FALSE                   => JSON::PP::false,
+    EXCLUDE_OUTPUTS         => 0,
+    INCLUDE_OUTPUTS         => 1,
+    HOME                    => _utils::env::fetchenvNonempty('HOME', sub { _utils::env::fetchenvNonempty('LOGDIR', sub { (getpwuid $<)[7] }) }),
+};
+
+use constant {
+    XDG_CONFIG_HOME => _utils::env::fetchenvNonempty('XDG_CONFIG_HOME', sub { _utils::path::catdir(HOME(), '.config') }),
+    XDG_STATE_HOME  => _utils::env::fetchenvNonempty('XDG_STATE_HOME', sub { _utils::path::catdir(HOME(), '.local/state') }),
+};
+
+use Class::Tiny qw(destination), {
+    _binDir => sub {
+        Nix::Store::getBinDir;
+    },
+
+    _nixBin => sub { _utils::path::catfile($_[0]->_binDir, 'nix') },
+
+    _nixStoreBin => sub { _utils::path::catfile($_[0]->_binDir, 'nix-store') },
+
+    _parser => sub {
+        my $parser = Getopt::Long::Parser->new;
+        $parser->configure( qw(pass_through) );
+        $parser;
+    },
+
+    checkSigs => TRUE,
+
+    closureType => DEFAULT_CLOSURE_TYPE,
+
+    configFile => _utils::env::fetchenvNamespaced('config-file', sub { _utils::path::catfile(XDG_CONFIG_HOME, 'nix-post-build-push/nix-post-build-push.json') }),
+
+    includeOutPaths => TRUE,
+
+    nixOpts => sub { [] },
+
+    substituteOnDestination => FALSE,
+
+    queueDir => _utils::path::catdir(XDG_STATE_HOME, 'nix-post-build-push'),
+
+    xargsBin => 'xargs',
+};
+
+sub _issueClosureTypeWarnings {
+    my $self = shift;
+
+    my $nixConfig = $self->nixConfig;
+    my $closureType = $self->closureType;
+
+    if ( $closureType eq 'cache' and !$nixConfig->{'keep-outputs'}{value} ) {
+        _utils::log::diag qq{selected closure type is "$closureType", but keep-outputs is disabled};
+    }
+
+    if ( ($closureType eq 'cache' or $closureType eq 'source') and !$nixConfig->{'keep-derivations'}{value} ) {
+        _utils::log::diag qq{selected closure type is "$closureType", but keep-derivations is disabled};
+    }
+}
+
+sub _setFromConfigFile {
+    my $self = shift;
+
+    my $configFile = $self->configFile;
+
+    open my $fh, '<', $configFile or do {
+        my $enoent = $!{ENOENT};
+
+        my $defaultConfigFile = Class::Tiny->get_all_attribute_defaults_for(ref $self)->{configFile};
+
+        # Don't complain if the default configuration file is missing.
+        return if (($configFile eq $defaultConfigFile) and $enoent);
+
+        _utils::log::bail qq{error opening "$configFile" for reading: $!};
+    };
+
+    my $json = JSON::PP->new->utf8;
+
+    $json->incr_parse($_) while <$fh>;
+
+    close $fh;
+
+    # croaks on error
+    my $config = $json->incr_parse;
+
+    my $reftype = ref $config // '<undef>';
+
+    _utils::log::bail qq{expected configuration file at "$configFile" to contain a hash, but got "${reftype}"}
+        unless $reftype eq 'HASH';
+
+    CORE::state $key2code = {
+        'check-sigs'                => sub { $self->checkSigs( $_[0] ) },
+        'closure-type'              => sub { $self->closureType( $_[0] ) },
+        'destination'               => sub { $self->destination( $_[0] ) },
+        'include-out-paths'         => sub { $self->includeOutPaths( $_[0] ) },
+        'nix-opts'                  => sub { $self->nixOpts( $_[0] ) },
+        'queue-dir'                 => sub { $self->queueDir( $_[0] ) },
+        'substitute-on-destination' => sub { $self->substituteOnDestination( $_[0] ) },
+        'xargs-bin'                 => sub { $self->xargsBin( $_[0] ) },
+    };
+
+    while ( my ( $key, $code ) = each %$key2code ) {
+        $code->($config->{$key}) if (exists $config->{$key} && $config->{$key} ne '');
+    }
+}
+
+sub _setFromEnv {
+    my $self = shift;
+
+    CORE::state $key2code = {
+        'check-sigs'                => sub { $self->checkSigs( $_[0] ) },
+        'closure-type'              => sub { $self->closureType( $_[0] ) },
+        'destination'               => sub { $self->destination( $_[0] ) },
+        'include-out-paths'         => sub { $self->includeOutPaths( $_[0] ) },
+        'queue-dir'                 => sub { $self->queueDir( $_[0] ) },
+        'substitute-on-destination' => sub { $self->substituteOnDestination( $_[0] ) },
+        'xargs-bin'                 => sub { $self->xargsBin( $_[0] ) },
+
+        'nix-opts' => sub {
+            require 'Text::ParseWords';
+            $self->nixOpts( [ Text::ParseWords::shellwords($_[0]) ] );
+        },
+    };
+
+    while ( my ( $key, $code ) = each %$key2code ) {
+        my $result = _utils::env::fetchenvNamespaced($key, sub { undef });
+        $code->($result) if defined $result;
+    }
+}
+
+sub run {
+    my $self = shift;
+
+    my $help = sub {
+        Pod::Usage::pod2usage(-verbose => 1, -exitval => 0);
+    };
+
+    my $doc = sub {
+        Pod::Usage::pod2usage(-verbose => 2, -exitval => 0);
+    };
+
+    my $version = sub {
+        print "nix-post-build-push $VERSION\n";
+    };
+
+    CORE::state $op2method = {
+        'upload-queued-paths'   => \&uploadQueuedPaths,
+        'perform-upload'        => \&performUpload,
+        'enqueue-paths'         => \&enqueuePaths,
+        'show-queued-paths'     => \&showQueuedPaths,
+        'show-closure'          => \&showClosure,
+        'help'                  => $help,
+        'doc'                   => $doc,
+        'man'                   => $doc,
+        'perldoc'               => $doc,
+        'version'               => $version,
+    };
+
+    my $op;
+    my @nix_opts;
+    my $parser = $self->_parser;
+
+    # First pass -- handle documentation options, plus `--config-file`.  This
+    # allows us to load whatever the configuration file prior to processing
+    # further, higher-precedence command-line options definitions.
+    $parser->getoptionsfromarray(
+        \@_,
+        'config-file=s'             => sub { $self->configFile( $_[1] ) },
+        'h|help'                    => $help,
+    );
+
+    $self->_setFromConfigFile;
+
+    $self->_setFromEnv;
+
+    $parser->getoptionsfromarray(
+        \@_,
+        'check-sigs!'                   => sub { $self->checkSigs( $_[1] ) },
+        'closure-type=s'                => sub { $self->closureType( $_[1] ) },
+        'destination=s'                 => sub { $self->destination( $_[1] ) },
+        'include-out-paths!'            => sub { $self->includeOutPaths( $_[1] ) },
+        'queue-dir=s'                   => sub { $self->queueDir( $_[1] ) },
+        'substitute-on-destination!'    => sub { $self->substituteOnDestination( $_[1] ) },
+        'xargs-bin=s'                   => sub { $self->xargsBin( $_[1] ) },
+
+        # Arbitrary Nix options
+        '<>' => sub {
+            if ( defined $op ) {
+                push @nix_opts, @_
+            }
+            else {
+                $op = $_[0];
+            }
+        },
+    ) or Pod::Usage::pod2usage(-verbose => 0, -exitval => 1);
+
+    $op //= 'upload-queued-paths';
+
+    my $method = $op2method->{$op} or Pod::Usage::pod2usage(
+        -verbose => 0,
+        -exitval => 1,
+        -message => sprintf('Unrecognized command "%s"; valid commands are: %s', $op, join(', ', sort keys %$op2method)),
+    );
+
+    $self->nixOpts( \@nix_opts );
+
+    shift if (scalar @_ && $_[0] eq '--');
+
+    $self->$method( @_ );
+}
+
+sub runNix {
+    my ( $self, %opts ) = @_;
+    my $cmd = delete %opts{command};
+    _utils::cmd::runCmd(%opts, command => [
+        $self->_nixBin,
+        qw(--extra-experimental-features nix-command),
+        @{$self->nixOpts},
+        @$cmd
+    ]);
+}
+
+sub runNixShowConfig {
+    shift->runNix( command => ['show-config'], @_ );
+}
+
+sub runNixStore {
+    my ( $self, %opts ) = @_;
+    my $cmd = delete %opts{command};
+    _utils::cmd::runCmd( %opts, command => [$self->_nixStoreBin, @$cmd] );
+}
+
+sub pipeToXargs {
+    my $self = shift;
+
+    my $xargs_cmd = _utils::cmd::constructCmd( $self->xargsBin, { null => TRUE, no_run_if_empty => TRUE });
+
+    my $pid = open my $fh, '|-', @$xargs_cmd, @_ or _utils::log::bail "failed to open pipe for writing to xargs: $!";
+
+    if ( defined (my $wantarray = wantarray) ) {
+        if ( $wantarray ) {
+            return ( $fh, $pid );
+        }
+        else {
+            return $fh;
+        }
+    }
+
+    # Caller didn't ask for a filehandle; pass through input from STDIN.
+    while ( <STDIN> ) {
+        chomp;
+        print $fh "$_\0";
+    }
+
+    close $fh;
+
+    _utils::proc::waitchild $pid;
+}
+
+sub nixConfig {
+    my $buffer;
+    my ( $ok, $err, undef, $stdout, $stderr ) = $_[0]->runNixShowConfig(options => { json => TRUE });
+    _utils::log::bail "$err: @$stderr" unless $ok;
+    my $json = JSON::PP->new->utf8;
+    $json->incr_parse($_) for @$stdout;
+    $json->incr_parse;
+}
+
+sub addIndirectRoot {
+    my ( $self, $root, $target ) = @_;
+
+    # Disable the `post_build_hook` to avoid queuing more stuff than is needed.
+    #$self->runNix( command => ['build', $target], options => { out_link => $root, post_build_hook => '' } );
+
+    $self->runNixStore( command => [$target], options => { add_root => $root, indirect => TRUE, realise => TRUE });
+};
+
+sub enqueuePaths {
+    my $self = shift;
+
+    $self->_issueClosureTypeWarnings;
+
+    my $queueDir = $self->queueDir;
+
+    my $all_ok = 1;
+    foreach my $target ( @_, ($self->includeOutPaths ? _utils::nix::outPaths : ()) ) {
+        my $storePath = Nix::Store::followLinksToStorePath($target);
+        my $basename = _utils::path::basename($storePath);
+        my $root = _utils::path::catfile( $queueDir, $basename );
+        my ( $ok, $err, $full ) = $self->addIndirectRoot( $root, $target );
+        _utils::log::diag qq{failed to enqueue "$target" at indirect root "$root": $err: @$full} unless $ok;
+        $all_ok &&= $ok;
+    };
+
+    _utils::log::bail 'failed to enqueue one or more store paths; exiting' unless $all_ok;
+}
+
+sub cleanQueue {
+    my $self = shift;
+
+    my $queueDir = _utils::path::canonpath($self->queueDir);
+
+    my $checker = sub {
+        my ( $checked ) = @_;
+
+        my $dirname = _utils::path::dirname($checked);
+
+        return ( 0, qq{it is not an immediate child of queue directory "$queueDir"} ) unless $dirname eq $queueDir;
+
+        return ( 0, 'it is not a symbolic link' ) unless -l $checked;
+
+        # Broken link; clean it up.
+        return ( 1, '' ) unless -e $checked;
+
+        eval {
+            Nix::Store::followLinksToStorePath( $checked );
+            1;
+        } or return ( 0, qq{its real path is not in the Nix store} );
+
+        return ( 1, '' );
+    };
+
+    foreach my $path ( @_ ) {
+        my ( $ok, $reason ) = $checker->($path);
+
+        if ( $ok ) {
+            unless ( unlink($path) or $!{ENOENT} ) {
+                _utils::log::diag qq{failed to remove queued path "$path": $!};
+            }
+        }
+        else {
+            _utils::log::diag qq{cowardly refusing to remove "$path" because $reason};
+        }
+    };
+}
+
+sub _grabClosure {
+    my $self = shift;
+
+    $self->_issueClosureTypeWarnings;
+
+    my @storePaths = $self->storePathsForPaths( @_ );
+
+    my @failed = $self->_addTempRootsForPaths( @storePaths );
+
+    foreach my $failed ( @failed ) {
+        _utils::log::diag qq{failed to add temporary gcroot for "$failed"};
+    }
+
+    $self->closureFor( $self->closureType, @_ );
+}
+
+sub performUpload {
+    my $self = shift;
+
+    my @closure = $self->_grabClosure( @_ ) or return;
+
+    my %nixCopyOpts = (
+        to => $self->destination,
+
+        # Pass `--no-recursive` because this script is responsible for
+        # specifying the the desired closure (vel non, in the "bare" case).
+        # XXX disabled because `nix copy` keeps complaining about "invalid
+        # references" when `--no-recursive` is in effect.
+        #no_recursive => TRUE,
+
+        # Additionally we disable the post-build-hook in order to avoid
+        # unnecessarily enqueuing dependencies that we're already in the middle
+        # of uploading.
+        post_build_hook => '',
+
+        ($self->checkSigs ? () : (no_check_sigs => TRUE)),
+        ($self->substituteOnDestination ? (substitute_on_destination => TRUE) : ()),
+    );
+
+    # In case we have a large number of files to copy, execute via `xargs`.
+    my $cmd = _utils::cmd::constructCmd(
+        $self->_nixBin,
+        qw(--experimental-features nix-command),
+        @{$self->nixOpts},
+        'copy',
+        \%nixCopyOpts
+    );
+
+    my $xargs_fh = $self->pipeToXargs( @$cmd );
+
+    print $xargs_fh "$_\0" for @closure;
+    close $xargs_fh;
+    _utils::proc::handlexargs $?, qq{"@{$cmd}"};
+
+    $self->cleanQueue( @_ );
+}
+
+sub groupQueuedPaths {
+    my $self = shift;
+
+    my $queueDir = $self->queueDir;
+
+    opendir my $dh, $queueDir or _utils::log::bail "failed to open queue directory ${queueDir}: $!\n";
+
+    my ( @links, @nonlinks, @broken );
+    while ( my $dent = readdir($dh) ) {
+        next if ($dent eq '.' or $dent eq '..');
+
+        my $next = _utils::path::catfile( $queueDir, $dent );
+
+        if ( -l $next ) {
+            # NOTE: **not** `-e _`, because:
+            #
+            #   If any of the file tests (or either the "stat" or "lstat"
+            #   operator) is given the special filehandle consisting of a
+            #   solitary underline, then the stat structure of the previous
+            #   file test (or "stat" operator) is used, saving a system call.
+            #   (This doesn't work with "-t", and you need to remember that
+            #   "lstat" and "-l" leave values in the stat structure for the
+            #   symbolic link, not the real file.)
+            #
+            # From `perldoc -f -X`.
+            if ( -e $next ) {
+                push @links, $next;
+            }
+            else {
+                push @broken, $next;
+            }
+        }
+        else {
+            push @nonlinks, $next;
+        }
+    }
+
+    return \@links, \@nonlinks, \@broken;
+}
+
+sub listQueuedPaths {
+    my $self = shift;
+    my ( $links, $nonlinks, $broken ) = $self->groupQueuedPaths;
+    _utils::log::diag map { qq{file "$_" is not a symbolic link as expected; ignoring it} } @$nonlinks;
+    _utils::log::diag map { qq{symbolic link "$_" is broken; ignoring it} } @$broken;
+    return @$links;
+}
+
+sub showQueuedPaths {
+    my $self = shift;
+    print map { "$_\n" } $self->listQueuedPaths;
+}
+
+sub showClosure {
+    my $self = shift;
+    print map { "$_\n" } $self->_grabClosure( $self->listQueuedPaths );
+}
+
+sub uploadQueuedPaths {
+    my $self = shift;
+    $self->performUpload( $self->listQueuedPaths );
+}
+
+# Assumes supplied paths are store paths
+sub _addTempRootsForPaths {
+    my $self = shift;
+
+    my @failed;
+    foreach my $storePath ( @_ ) {
+        eval { Nix::Store::addTempRoot( $storePath ); 1 } or push @failed, $storePath;
+    }
+
+    return @failed;
+}
+
+sub storePathsForPaths {
+    my $self = shift;
+    uniqstr map { Nix::Store::followLinksToStorePath($_) } @_;
+}
+
+sub derivers {
+    my $self = shift;
+    uniqstr grep { defined } map { Nix::Store::queryDeriver($_) } @_;
+}
+
+sub deriversForPaths {
+    my $self = shift;
+    $self->derivers( $self->storePathsForPaths( @_ ) );
+}
+
+sub closure {
+    my $self = shift;
+    my $includeOutputs = !!shift;
+    reverse Nix::Store::topoSortPaths(Nix::Store::computeFSClosure( 0, $includeOutputs, @_ ));
+}
+
+sub binaryClosure {
+    my $self = shift;
+    $self->closure( EXCLUDE_OUTPUTS, $self->storePathsForPaths( @_ ) );
+}
+
+sub sourceClosure {
+    my $self = shift;
+    $self->closure( EXCLUDE_OUTPUTS, $self->deriversForPaths( @_ ) );
+}
+
+sub cacheClosure {
+    my $self = shift;
+    $self->closure( INCLUDE_OUTPUTS, $self->deriversForPaths( @_ ) );
+}
+
+# Not really a closure...
+{
+    no warnings 'once';
+    *bareClosure = \&storePathsForPaths;
+}
+
+sub closureFor {
+    my $self = shift;
+    my $type = shift;
+    my $method = $self->can("${type}Closure") or _utils::log::bail qq{$0: unsupported closure type "$type"\n};
+    $self->$method( @_ );
+}
+
+__PACKAGE__->new->run( @ARGV ) unless caller;
+
+1;
+
+__END__
+
+=pod
+
+=head1 NAME
+
+    nix-post-build-push - push Nix build results to a remote cache, asynchronously
+
+=head1 SYNOPSIS
+
+    $ nix-post-build-push [<option> ...] <command> [<nix-option> ...] [-- <store-path-or-out-link> ...]
+
+=head1 ARGUMENTS
+
+Upload store paths:
+
+    $ nix-post-build-push [<option> ...] perform-upload [<nix-option> ...] [-- <store-path-or-out-link> ...]
+
+Enqueue store paths for later upload:
+
+    $ nix-post-build-push [<option> ...] enqueue-paths [<nix-option> ...] [-- <store-path-or-out-link> ...]
+
+Upload queued store paths:
+
+    $ nix-post-build-push [<option> ...] upload-queued-paths [<nix-option> ...]
+
+Display queued paths:
+
+    $ nix-post-build-push [<option> ...] show-queued-paths [<nix-option> ...]
+
+Display the closure of all queued paths:
+
+    $ nix-post-build-push [<option> ...] show-closure [<nix-option> ...]
+
+Show a usage message:
+
+    $ nix-post-build-push [<option> ...] help
+
+Show all C<< nix-post-build-push >> documentation:
+
+    $ nix-post-build-push [<option> ...] doc # or "man", or "perldoc"
+
+Show the C<< nix-post-build-push >> version:
+
+    $ nix-post-build-push [<option> ...] version
+
+=head1 OPTIONS
+
+=head2 --[no-]check-sigs
+
+When disabled, pass C<< --no-check-sigs >> to C<< nix copy >>; otherwise, omit
+it.
+
+Enabled by default.
+
+=head2 --closure-type {bare,binary,source,cache}
+
+The set of packages to upload to the destination cache or chroot store.
+
+=head3 bare
+
+Not really a closure.  Just the store paths linked from within the queue
+directory.
+
+Not fully supported, as C<< nix copy >> copies B<< closures >> by default, and
+using C<< nix copy >>'s C<< --no-recursive >> option tends to lead to errors
+about "invalid references".
+
+=head3 binary
+
+The closure of the store paths linked from within the queue directory.
+
+C<< nix-store --query --requisites [<path> ...] >>.
+
+=head3 source
+
+The closure of the derivers of the store paths linked from within the queue
+directory.
+
+C<< nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites --include-outputs >>.
+
+=head3 cache
+
+The union of the binary and source closures.
+
+=head2 --config-file <path>
+
+Path to a JSON file containing configuration parameters for
+C<< nix-post-build-push >>.
+
+Default is C<< ${XDG_CONFIG_HOME}/nix-post-build-push/nix-post-build-push.json >>.
+
+=head2 --destination <url|path>
+
+The URL of the target cache or path of the target chroot store.  Equivalent to
+C<< nix copy >>'s C<< --to >> option.
+
+This option is mandatory; there is no default.
+
+=head2 --[no-]include-out-paths
+
+When enabled, the C<< enqueue-paths >> command will enqueue the store paths
+listed in the C<< OUT_PATHS >> environment variable, as well as whatever paths
+were passed as positional parameters to C<< nix-post-build-push >>.
+
+Enabled by default.
+
+=head2 --queue-dir <path>
+
+Path to the directory that C<< nix-post-build-push >> should use for managing
+its queue of symbolic links to store paths.
+
+Default is C<< ${XDG_STATE_HOME}/nix-post-build-push >>.
+
+=head2 --[no-]substitute-on-destination
+
+When enabled, pass C<< --substitute-on-destination >> to C<< nix copy >>;
+otherwise, omit it.
+
+Disabled by default.
+
+=head2 --xargs-bin <name|path>
+
+Name of or path to the C<< xargs >> executable.
+
+Default is C<< xargs >>.
+
+=head2 C<< nix >> OPTIONS
+
+All other options are passed through to the C<< nix >> executable.
+
+=head2 FILES
+
+Any arguments appearing after a bare C<< -- >> are treated as paths to enqueue
+(by C<< enqueue-paths >>) or paths to upload (by C<< perform-upload >>).
+
+=head1 ENVIRONMENT VARIABLES
+
+Options provided as environment variables are higher-precedence than those
+defined in the configuration file, but lower-precedence than those defined at
+the command line.
+
+=head2 NIX_POST_BUILD_PUSH_CHECK_SIGS={0,1}
+
+Equivalent to C<< --[no-]check-sigs >>.
+
+=head2 NIX_POST_BUILD_PUSH_CLOSURE_TYPE={bare,binary,source,cache}
+
+Equivalent to C<< --closure-type >>.
+
+=head2 NIX_POST_BUILD_PUSH_CONFIG_FILE=<path>
+
+Equivalent to C<< --config-file >>.
+
+=head2 NIX_POST_BUILD_PUSH_DESTINATION=<url|path>
+
+Equivalent to C<< --destination >>.
+
+=head2 NIX_POST_BUILD_PUSH_INCLUDE_OUT_PATHS={0,1}
+
+Equivalent to C<< --[no-]include-out-paths >>.
+
+=head2 NIX_POST_BUILD_PUSH_NIX_OPTS=<string>
+
+Arbitrary options to pass to the C<< nix >> executable.
+
+This value is parsed into a list via L<< Text::ParseWords >>'s C<< shellwords >>.
+
+=head2 NIX_POST_BUILD_PUSH_QUEUE_DIR=<path>
+
+Equivalent to C<< --queue-dir >>.
+
+=head2 NIX_POST_BUILD_PUSH_SUBSTITUTE_ON_DESTINATION={0,1}
+
+Equivalent to C<< --[no-]substitute-on-destination >>.
+
+=head2 NIX_POST_BUILD_PUSH_XARGS_BIN=<name|path>
+
+Equivalent to C<< --xargs-bin >>.
+
+=head1 CONFIGURATION FILE
+
+Options provided in the configuration file are lower-precedence than those
+defined as environment variables and those defined at the command line.
+
+=head2 check-sigs <bool>
+
+Equivalent to C<< --[no-]check-sigs >>.
+
+=head2 closure-type <string>
+
+Equivalent to C<< --closure-type >>.
+
+=head2 destination <string>
+
+Equivalent to C<< --destination >>.
+
+=head2 include-out-paths <bool>
+
+Equivalent to C<< --[no-]include-out-paths >>.
+
+=head2 nix-opts <list[string]>
+
+Equivalent to C<< NIX_POST_BUILD_PUSH_NIX_OPTS >>.
+
+=head2 queue-dir <string>
+
+Equivalent to C<< --queue-dir >>.
+
+=head2 substitute-on-destination <bool>
+
+Equivalent to C<< --[no-]substitute-on-destination >>.
+
+=head2 xargs-bin <string>
+
+Equivalent to C<< --xargs-bin >>.
+
+=cut
