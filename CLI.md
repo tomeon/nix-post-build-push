@@ -73,11 +73,14 @@ The closure of the store paths linked from within the queue directory.
 The closure of the derivers of the store paths linked from within the queue
 directory.
 
-`nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites --include-outputs`.
+`nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites`.
 
 ### cache
 
-The union of the binary and source closures.
+The closure of the derivers of the store paths linked from within the queue
+directory, plus the closures of the derivers' output paths.
+
+`nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites --include-outputs`.
 
 ## --config-file &lt;path>
 

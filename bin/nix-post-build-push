@@ -786,11 +786,14 @@ C<< nix-store --query --requisites [<path> ...] >>.
 The closure of the derivers of the store paths linked from within the queue
 directory.
 
-C<< nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites --include-outputs >>.
+C<< nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites >>.
 
 =head3 cache
 
-The union of the binary and source closures.
+The closure of the derivers of the store paths linked from within the queue
+directory, plus the closures of the derivers' output paths.
+
+C<< nix-store --query --deriver [<path> ...] | xargs nix-store --query --requisites --include-outputs >>.
 
 =head2 --config-file <path>
 
