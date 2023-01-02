@@ -1,0 +1,5 @@
+image: nixos/unstable
+tasks:
+  - check: |
+      cd nix-post-build-push
+      nix --experimental-features 'flakes nix-command' flake check -L
